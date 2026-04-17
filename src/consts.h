@@ -14,6 +14,7 @@ const char *const MODEL_ENHANCE_ZERODCE = "models/zero_dce_180x320.onnx";
 const char *const USEGPU_CPU = "cpu";
 const char *const USEGPU_DML = "dml";
 const char *const USEGPU_CUDA = "cuda";
+const char *const USEGPU_MIGRAPHX = "migraphx";
 const char *const USEGPU_TENSORRT = "tensorrt";
 const char *const USEGPU_COREML = "coreml";
 

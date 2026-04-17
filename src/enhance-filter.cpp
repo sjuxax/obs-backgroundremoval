@@ -53,7 +53,12 @@ static obs_properties_t *filter_properties(void *data)
                                                       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
   obs_property_list_add_string(p_use_gpu, obs_module_text("CPU"), USEGPU_CPU);
 #ifdef __linux__
-  obs_property_list_add_string(p_use_gpu, obs_module_text("GPUTensorRT"), USEGPU_TENSORRT);
+  const char *linuxGpuProvider = getLinuxGpuExecutionProviderValue();
+  const char *linuxGpuProviderTextKey = getLinuxGpuExecutionProviderTextKey();
+  if (linuxGpuProvider != nullptr && linuxGpuProviderTextKey != nullptr) {
+    obs_property_list_add_string(p_use_gpu, obs_module_text(linuxGpuProviderTextKey),
+                                 linuxGpuProvider);
+  }
 #endif
 #if _WIN32
   obs_property_list_add_string(p_use_gpu, obs_module_text("GPUDirectML"), USEGPU_DML);
@@ -99,7 +104,11 @@ static void filter_update(void *data, obs_data_t *settings)
   tf->blendFactor = (float)obs_data_get_double(settings, "blend");
   const uint32_t newNumThreads = (uint32_t)obs_data_get_int(settings, "numThreads");
   const std::string newModel = obs_data_get_string(settings, "model_select");
-  const std::string newUseGpu = obs_data_get_string(settings, "useGPU");
+  std::string newUseGpu = obs_data_get_string(settings, "useGPU");
+#ifdef __linux__
+  newUseGpu = normalizeGpuProviderSelection(newUseGpu);
+  obs_data_set_string(settings, "useGPU", newUseGpu.c_str());
+#endif
 
   if (tf->modelSelection.empty() || tf->modelSelection != newModel || tf->useGPU != newUseGpu ||
       tf->numThreads != newNumThreads) {
@@ -137,9 +146,6 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 
   tf->source = source;
   tf->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-
-  std::string instanceName{"enhance-portrait-inference"};
-  tf->env.reset(new Ort::Env(OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR, instanceName.c_str()));
 
   filter_update(tf, settings);
 

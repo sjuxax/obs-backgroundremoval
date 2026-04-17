@@ -5,7 +5,6 @@
 
 struct ORTModelData {
   std::unique_ptr<Ort::Session> session;
-  std::unique_ptr<Ort::Env> env;
   std::vector<Ort::AllocatedStringPtr> inputNames;
   std::vector<Ort::AllocatedStringPtr> outputNames;
   std::vector<Ort::Value> inputTensor;

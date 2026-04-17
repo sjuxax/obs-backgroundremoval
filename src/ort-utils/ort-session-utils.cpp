@@ -1,12 +1,15 @@
 #include <onnxruntime_cxx_api.h>
 #include <cpu_provider_factory.h>
 
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <vector>
+
 #if defined(__APPLE__)
 #include <coreml_provider_factory.h>
-#endif
-
-#ifdef __linux__
-#include <tensorrt_provider_factory.h>
 #endif
 
 #ifdef _WIN32
@@ -19,22 +22,228 @@
 #include "ort-session-utils.h"
 #include "consts.h"
 
+#if defined(__linux__)
+namespace {
+
+struct LinuxExecutionProviderAvailability {
+  bool migraphx = false;
+  bool tensorrt = false;
+};
+
+void setLinuxEnvironmentPathIfUnset(const char *variableName,
+                                    const std::filesystem::path &path)
+{
+  if (std::getenv(variableName) != nullptr) {
+    return;
+  }
+  const auto normalizedPath = path.lexically_normal().string();
+  if (!normalizedPath.empty()) {
+    setenv(variableName, normalizedPath.c_str(), 0);
+  }
+}
+
+void setupLinuxAmdCaches()
+{
+  static std::once_flag cacheSetupOnce;
+  std::call_once(cacheSetupOnce, []() {
+    if (!std::filesystem::is_directory("/opt/rocm")) {
+      return;
+    }
+
+    char *miopenPathRaw = obs_module_config_path("amd/miopen");
+    char *migraphxPathRaw = obs_module_config_path("amd/migraphx");
+
+    if (miopenPathRaw != nullptr) {
+      const std::filesystem::path miopenPath(miopenPathRaw);
+      std::error_code ec;
+      std::filesystem::create_directories(miopenPath, ec);
+      setLinuxEnvironmentPathIfUnset("MIOPEN_USER_DB_PATH", miopenPath);
+      setLinuxEnvironmentPathIfUnset("MIOPEN_CUSTOM_CACHE_DIR", miopenPath);
+      bfree(miopenPathRaw);
+    }
+
+    if (migraphxPathRaw != nullptr) {
+      const std::filesystem::path migraphxPath(migraphxPathRaw);
+      std::error_code ec;
+      std::filesystem::create_directories(migraphxPath, ec);
+      setLinuxEnvironmentPathIfUnset("ORT_MIGRAPHX_CACHE_PATH", migraphxPath);
+      setLinuxEnvironmentPathIfUnset("ORT_MIGRAPHX_MODEL_CACHE_PATH", migraphxPath);
+      bfree(migraphxPathRaw);
+    }
+  });
+}
+
+const LinuxExecutionProviderAvailability &getLinuxExecutionProviderAvailability()
+{
+  static const LinuxExecutionProviderAvailability availability = []() {
+    LinuxExecutionProviderAvailability providers;
+    try {
+      const auto names = Ort::GetAvailableProviders();
+      for (const auto &n : names) {
+        if (n.find("MIGraphX") != std::string::npos) providers.migraphx = true;
+        if (n.find("Tensorrt") != std::string::npos || n.find("TensorRT") != std::string::npos)
+          providers.tensorrt = true;
+      }
+    } catch (const std::exception &e) {
+      blog(LOG_WARNING, "Failed to enumerate ONNX Runtime providers: %s", e.what());
+    }
+    return providers;
+  }();
+  return availability;
+}
+
+// Loading MIGraphX's provider library pulls in libmigraphx_tf, which registers
+// its own copy of TensorFlow's tensor_shape.proto into libprotobuf's global
+// descriptor pool. If anything else in the OBS process has already registered
+// a TF descriptor (libopencv_dnn, libtensorflow, libopenvino's TF frontend),
+// the protobuf CHECK aborts the entire process. Detect that situation and skip
+// MIGraphX so the user gets a fallback instead of a crash.
+bool isProtobufConflictRisk(std::string &conflictingLib)
+{
+  static const char *const conflictMarkers[] = {
+    "libopencv_dnn",
+    "libtensorflow",
+    "libtensorflow_framework",
+    "libopenvino_tensorflow_frontend",
+  };
+  std::ifstream maps("/proc/self/maps");
+  if (!maps.is_open()) return false;
+  std::string line;
+  while (std::getline(maps, line)) {
+    for (const char *marker : conflictMarkers) {
+      if (line.find(marker) != std::string::npos) {
+        const auto slash = line.rfind('/');
+        conflictingLib = (slash != std::string::npos) ? line.substr(slash + 1) : marker;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool isLinuxGpuProviderSelection(const std::string &useGPU)
+{
+  return useGPU == USEGPU_MIGRAPHX || useGPU == USEGPU_TENSORRT;
+}
+
+Ort::Env &getSharedOrtEnv()
+{
+  static Ort::Env env = []() {
+    setupLinuxAmdCaches();
+    return Ort::Env(OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, "obs-backgroundremoval");
+  }();
+  return env;
+}
+
+void resetOrtSessionState(filter_data *tf)
+{
+  tf->session.reset();
+  tf->inputNames.clear();
+  tf->outputNames.clear();
+  tf->inputTensor.clear();
+  tf->outputTensor.clear();
+  tf->inputDims.clear();
+  tf->outputDims.clear();
+  tf->inputTensorValues.clear();
+  tf->outputTensorValues.clear();
+}
+
+void appendLinuxExecutionProvider(Ort::SessionOptions &sessionOptions,
+                                  const std::string &providerName)
+{
+  if (providerName == USEGPU_MIGRAPHX) {
+    std::string conflict;
+    if (isProtobufConflictRisk(conflict)) {
+      throw Ort::Exception(
+        ("MIGraphX cannot be initialized because " + conflict +
+         " is loaded in this process; loading MIGraphX's TF parser would "
+         "duplicate-register protobuf descriptors and abort. Disable the "
+         "conflicting plugin or pick a different provider.")
+          .c_str(),
+        ORT_FAIL);
+    }
+    OrtMIGraphXProviderOptions migraphxOptions{};
+    migraphxOptions.device_id = 0;
+    sessionOptions.AppendExecutionProvider_MIGraphX(migraphxOptions);
+    blog(LOG_INFO, "Using ONNX Runtime execution provider: MIGraphX");
+    return;
+  }
+
+  if (providerName == USEGPU_TENSORRT) {
+    OrtTensorRTProviderOptions tensorrtOptions{};
+    tensorrtOptions.device_id = 0;
+    tensorrtOptions.trt_max_partition_iterations = 1000;
+    tensorrtOptions.trt_min_subgraph_size = 1;
+    tensorrtOptions.trt_max_workspace_size = 1U << 30;
+    sessionOptions.AppendExecutionProvider_TensorRT(tensorrtOptions);
+    blog(LOG_INFO, "Using ONNX Runtime execution provider: TensorRT");
+    return;
+  }
+}
+
+void configureSessionOptions(filter_data *tf, Ort::SessionOptions &sessionOptions)
+{
+  sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+  if (tf->useGPU == USEGPU_CPU) {
+    sessionOptions.SetInterOpNumThreads(tf->numThreads);
+    sessionOptions.SetIntraOpNumThreads(tf->numThreads);
+    return;
+  }
+
+  if (tf->useGPU == USEGPU_TENSORRT) {
+    sessionOptions.DisableMemPattern();
+    sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+  }
+}
+
+bool tryCreateCpuFallbackSession(filter_data *tf)
+{
+  try {
+    Ort::SessionOptions cpuSessionOptions;
+    tf->useGPU = USEGPU_CPU;
+    configureSessionOptions(tf, cpuSessionOptions);
+    resetOrtSessionState(tf);
+    tf->session.reset(new Ort::Session(getSharedOrtEnv(), tf->modelFilepath, cpuSessionOptions));
+    blog(LOG_WARNING, "Fell back to CPU execution provider");
+    return true;
+  } catch (const std::exception &e) {
+    blog(LOG_ERROR, "CPU fallback session creation failed: %s", e.what());
+    return false;
+  }
+}
+
+} // namespace
+
+const char *getLinuxGpuExecutionProviderValue()
+{
+  const auto &availability = getLinuxExecutionProviderAvailability();
+  if (availability.migraphx) return USEGPU_MIGRAPHX;
+  if (availability.tensorrt) return USEGPU_TENSORRT;
+  return nullptr;
+}
+
+const char *getLinuxGpuExecutionProviderTextKey()
+{
+  const char *providerValue = getLinuxGpuExecutionProviderValue();
+  if (providerValue == nullptr) return nullptr;
+  return providerValue == std::string(USEGPU_MIGRAPHX) ? "GPUMIGraphX" : "GPUTensorRT";
+}
+
+std::string normalizeGpuProviderSelection(const std::string &useGPU)
+{
+  if (!isLinuxGpuProviderSelection(useGPU)) return useGPU;
+  const char *providerValue = getLinuxGpuExecutionProviderValue();
+  if (providerValue == nullptr) return USEGPU_CPU;
+  return providerValue;
+}
+#endif
+
 void createOrtSession(filter_data *tf)
 {
   if (tf->model.get() == nullptr) {
     blog(LOG_ERROR, "Model object is not initialized");
     return;
-  }
-
-  Ort::SessionOptions sessionOptions;
-
-  sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-  if (tf->useGPU != USEGPU_CPU) {
-    sessionOptions.DisableMemPattern();
-    sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-  } else {
-    sessionOptions.SetInterOpNumThreads(tf->numThreads);
-    sessionOptions.SetIntraOpNumThreads(tf->numThreads);
   }
 
   char *modelFilepath_rawPtr = obs_module_file(tf->modelSelection.c_str());
@@ -56,9 +265,33 @@ void createOrtSession(filter_data *tf)
 #endif
 
   try {
-#ifdef __linux__
-    if (tf->useGPU == USEGPU_TENSORRT) {
-      Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_Tensorrt(sessionOptions, 0));
+#if defined(__linux__)
+    tf->useGPU = normalizeGpuProviderSelection(tf->useGPU);
+    Ort::SessionOptions sessionOptions;
+    configureSessionOptions(tf, sessionOptions);
+    resetOrtSessionState(tf);
+    try {
+      if (tf->useGPU != USEGPU_CPU) {
+        appendLinuxExecutionProvider(sessionOptions, tf->useGPU);
+      }
+      tf->session.reset(new Ort::Session(getSharedOrtEnv(), tf->modelFilepath, sessionOptions));
+    } catch (const std::exception &e) {
+      blog(LOG_WARNING,
+           "Failed to create Linux execution provider '%s' session: %s. Falling back to CPU.",
+           tf->useGPU.c_str(), e.what());
+      if (!tryCreateCpuFallbackSession(tf)) {
+        return;
+      }
+    }
+#else
+    Ort::SessionOptions sessionOptions;
+    sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    if (tf->useGPU != USEGPU_CPU) {
+      sessionOptions.DisableMemPattern();
+      sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+    } else {
+      sessionOptions.SetInterOpNumThreads(tf->numThreads);
+      sessionOptions.SetIntraOpNumThreads(tf->numThreads);
     }
 #endif
 #ifdef _WIN32
@@ -78,7 +311,11 @@ void createOrtSession(filter_data *tf)
         OrtSessionOptionsAppendExecutionProvider_CoreML(sessionOptions, coreml_flags));
     }
 #endif
-    tf->session.reset(new Ort::Session(*tf->env, tf->modelFilepath, sessionOptions));
+#if !defined(__linux__)
+    static Ort::Env env(OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, "obs-backgroundremoval");
+    resetOrtSessionState(tf);
+    tf->session.reset(new Ort::Session(env, tf->modelFilepath, sessionOptions));
+#endif
   } catch (const std::exception &e) {
     blog(LOG_ERROR, "%s", e.what());
     return;

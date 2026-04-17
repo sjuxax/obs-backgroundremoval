@@ -64,7 +64,7 @@ Tutorial video on YouTube: https://youtu.be/veqNEsMqEE0
 GPU support:
 * Currently on Windows we support DirectML, which should reduce CPU usage by 95% and effectively use the systems accelerators (GPUs if available).
 * On Mac we support CoreML for acceleration, which is available on M1 and M2 (not Intel, sorry).
-* CUDA is supported in this plugin through TensorRT, however it is supported only on Linux.
+* On Linux, the plugin uses the detected ONNX Runtime GPU backend. MIGraphX is preferred on AMD/ROCm systems, and TensorRT is still used when that is the available provider.
 * The goal of this plugin is to be available for everyone on every system, even if they don't own a GPU.
 
 Number of CPU threads is controllable through the UI settings. A 2-thread setting works best.
