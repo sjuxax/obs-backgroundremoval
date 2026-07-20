@@ -15,6 +15,19 @@ class ModelSINET : public ModelBCHW {
                  resizedImage);
     hwc_to_chw(resizedImage, preprocessedImage);
   }
+
+  virtual void postprocessOutput(cv::Mat &output)
+  {
+    // Softmax is 2-class BCHW (background, person). Convert to HWC then keep person.
+    ModelBCHW::postprocessOutput(output);
+    std::vector<cv::Mat> channels;
+    cv::split(output, channels);
+    if (channels.size() >= 2) {
+      output = channels[1];
+    } else if (!channels.empty()) {
+      output = channels[0];
+    }
+  }
 };
 
 #endif // MODELSINET_H
