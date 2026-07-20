@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -66,6 +67,8 @@ void setupLinuxAmdCaches()
       const std::filesystem::path migraphxPath(migraphxPathRaw);
       std::error_code ec;
       std::filesystem::create_directories(migraphxPath, ec);
+      // Env vars used by older ORT builds; newer builds also take model cache via
+      // provider options where available.
       setLinuxEnvironmentPathIfUnset("ORT_MIGRAPHX_CACHE_PATH", migraphxPath);
       setLinuxEnvironmentPathIfUnset("ORT_MIGRAPHX_MODEL_CACHE_PATH", migraphxPath);
       bfree(migraphxPathRaw);
@@ -73,9 +76,21 @@ void setupLinuxAmdCaches()
   });
 }
 
+Ort::Env &getSharedOrtEnv()
+{
+  static Ort::Env env = []() {
+    setupLinuxAmdCaches();
+    return Ort::Env(OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, "obs-backgroundremoval");
+  }();
+  return env;
+}
+
 const LinuxExecutionProviderAvailability &getLinuxExecutionProviderAvailability()
 {
   static const LinuxExecutionProviderAvailability availability = []() {
+    // Ensure Ort::Env (and DefaultLogger) exists before loading provider libs.
+    getSharedOrtEnv();
+
     LinuxExecutionProviderAvailability providers;
     try {
       const auto names = Ort::GetAvailableProviders();
@@ -126,15 +141,6 @@ bool isLinuxGpuProviderSelection(const std::string &useGPU)
   return useGPU == USEGPU_MIGRAPHX || useGPU == USEGPU_TENSORRT;
 }
 
-Ort::Env &getSharedOrtEnv()
-{
-  static Ort::Env env = []() {
-    setupLinuxAmdCaches();
-    return Ort::Env(OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, "obs-backgroundremoval");
-  }();
-  return env;
-}
-
 void resetOrtSessionState(filter_data *tf)
 {
   tf->session.reset();
@@ -146,6 +152,41 @@ void resetOrtSessionState(filter_data *tf)
   tf->outputDims.clear();
   tf->inputTensorValues.clear();
   tf->outputTensorValues.clear();
+}
+
+bool populateSessionTensors(filter_data *tf)
+{
+  if (tf->session.get() == nullptr || tf->model.get() == nullptr) {
+    return false;
+  }
+
+  tf->model->populateInputOutputNames(tf->session, tf->inputNames, tf->outputNames);
+
+  if (!tf->model->populateInputOutputShapes(tf->session, tf->inputDims, tf->outputDims)) {
+    blog(LOG_ERROR, "Unable to get model input and output shapes");
+    return false;
+  }
+
+  for (size_t i = 0; i < tf->inputNames.size(); i++) {
+    blog(LOG_INFO, "Model %s input %d: name %s shape (%d dim) %d x %d x %d x %d",
+         tf->modelSelection.c_str(), (int)i, tf->inputNames[i].get(), (int)tf->inputDims[i].size(),
+         (int)tf->inputDims[i][0],
+         ((int)tf->inputDims[i].size() > 1) ? (int)tf->inputDims[i][1] : 0,
+         ((int)tf->inputDims[i].size() > 2) ? (int)tf->inputDims[i][2] : 0,
+         ((int)tf->inputDims[i].size() > 3) ? (int)tf->inputDims[i][3] : 0);
+  }
+  for (size_t i = 0; i < tf->outputNames.size(); i++) {
+    blog(LOG_INFO, "Model %s output %d: name %s shape (%d dim) %d x %d x %d x %d",
+         tf->modelSelection.c_str(), (int)i, tf->outputNames[i].get(),
+         (int)tf->outputDims[i].size(), (int)tf->outputDims[i][0],
+         ((int)tf->outputDims[i].size() > 1) ? (int)tf->outputDims[i][1] : 0,
+         ((int)tf->outputDims[i].size() > 2) ? (int)tf->outputDims[i][2] : 0,
+         ((int)tf->outputDims[i].size() > 3) ? (int)tf->outputDims[i][3] : 0);
+  }
+
+  tf->model->allocateTensorBuffers(tf->inputDims, tf->outputDims, tf->outputTensorValues,
+                                   tf->inputTensorValues, tf->inputTensor, tf->outputTensor);
+  return true;
 }
 
 void appendLinuxExecutionProvider(Ort::SessionOptions &sessionOptions,
@@ -162,8 +203,21 @@ void appendLinuxExecutionProvider(Ort::SessionOptions &sessionOptions,
           .c_str(),
         ORT_FAIL);
     }
+    // Zero-init leaves migraphx_mem_limit at 0; ORT's default is SIZE_MAX.
     OrtMIGraphXProviderOptions migraphxOptions{};
     migraphxOptions.device_id = 0;
+    migraphxOptions.migraphx_fp16_enable = 0;
+    migraphxOptions.migraphx_fp8_enable = 0;
+    migraphxOptions.migraphx_int8_enable = 0;
+    migraphxOptions.migraphx_use_native_calibration_table = 0;
+    migraphxOptions.migraphx_int8_calibration_table_name = nullptr;
+    migraphxOptions.migraphx_save_compiled_model = 0;
+    migraphxOptions.migraphx_save_model_path = nullptr;
+    migraphxOptions.migraphx_load_compiled_model = 0;
+    migraphxOptions.migraphx_load_model_path = nullptr;
+    migraphxOptions.migraphx_exhaustive_tune = false;
+    migraphxOptions.migraphx_mem_limit = std::numeric_limits<size_t>::max();
+    migraphxOptions.migraphx_arena_extend_strategy = 0;
     sessionOptions.AppendExecutionProvider_MIGraphX(migraphxOptions);
     blog(LOG_INFO, "Using ONNX Runtime execution provider: MIGraphX");
     return;
@@ -191,20 +245,28 @@ void configureSessionOptions(filter_data *tf, Ort::SessionOptions &sessionOption
     return;
   }
 
-  if (tf->useGPU == USEGPU_TENSORRT) {
-    sessionOptions.DisableMemPattern();
-    sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-  }
+  // GPU EPs (TensorRT, MIGraphX): sequential + no mem pattern, matching other platforms.
+  sessionOptions.DisableMemPattern();
+  sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
 }
 
 bool tryCreateCpuFallbackSession(filter_data *tf)
 {
   try {
+    if (tf->modelFilepathStorage.empty()) {
+      blog(LOG_ERROR, "CPU fallback session creation failed: model path is empty");
+      return false;
+    }
+
     Ort::SessionOptions cpuSessionOptions;
     tf->useGPU = USEGPU_CPU;
     configureSessionOptions(tf, cpuSessionOptions);
     resetOrtSessionState(tf);
-    tf->session.reset(new Ort::Session(getSharedOrtEnv(), tf->modelFilepath, cpuSessionOptions));
+    tf->session.reset(
+      new Ort::Session(getSharedOrtEnv(), tf->modelFilepathStorage.c_str(), cpuSessionOptions));
+    if (!populateSessionTensors(tf)) {
+      return false;
+    }
     blog(LOG_WARNING, "Fell back to CPU execution provider");
     return true;
   } catch (const std::exception &e) {
@@ -253,15 +315,14 @@ void createOrtSession(filter_data *tf)
     return;
   }
 
-  std::string modelFilepath_s(modelFilepath_rawPtr);
+  tf->modelFilepathStorage = modelFilepath_rawPtr;
   bfree(modelFilepath_rawPtr);
 
 #if _WIN32
-  std::wstring modelFilepath_ws(modelFilepath_s.size(), L' ');
-  std::copy(modelFilepath_s.begin(), modelFilepath_s.end(), modelFilepath_ws.begin());
-  tf->modelFilepath = modelFilepath_ws.c_str();
+  tf->modelFilepathWStorage.assign(tf->modelFilepathStorage.begin(), tf->modelFilepathStorage.end());
+  tf->modelFilepath = tf->modelFilepathWStorage.c_str();
 #else
-  tf->modelFilepath = modelFilepath_s.c_str();
+  tf->modelFilepath = tf->modelFilepathStorage.c_str();
 #endif
 
   try {
@@ -282,6 +343,8 @@ void createOrtSession(filter_data *tf)
       if (!tryCreateCpuFallbackSession(tf)) {
         return;
       }
+      // tryCreateCpuFallbackSession already populated tensors
+      return;
     }
 #else
     Ort::SessionOptions sessionOptions;
@@ -321,6 +384,11 @@ void createOrtSession(filter_data *tf)
     return;
   }
 
+#if defined(__linux__)
+  if (!populateSessionTensors(tf)) {
+    return;
+  }
+#else
   Ort::AllocatorWithDefaultOptions allocator;
 
   tf->model->populateInputOutputNames(tf->session, tf->inputNames, tf->outputNames);
@@ -350,6 +418,7 @@ void createOrtSession(filter_data *tf)
   // Allocate buffers
   tf->model->allocateTensorBuffers(tf->inputDims, tf->outputDims, tf->outputTensorValues,
                                    tf->inputTensorValues, tf->inputTensor, tf->outputTensor);
+#endif
 }
 
 bool runFilterModelInference(filter_data *tf, const cv::Mat &imageBGRA, cv::Mat &output)
@@ -382,9 +451,39 @@ bool runFilterModelInference(filter_data *tf, const cv::Mat &imageBGRA, cv::Mat 
 
   tf->model->loadInputToTensor(preprocessedImage, inputWidth, inputHeight, tf->inputTensorValues);
 
-  // Run network inference
-  tf->model->runNetworkInference(tf->session, tf->inputNames, tf->outputNames, tf->inputTensor,
-                                 tf->outputTensor);
+  // Run network inference (with one-shot GPU→CPU fallback on Linux)
+  try {
+    tf->model->runNetworkInference(tf->session, tf->inputNames, tf->outputNames, tf->inputTensor,
+                                   tf->outputTensor);
+  } catch (const Ort::Exception &e) {
+#if defined(__linux__)
+    if (tf->useGPU != USEGPU_CPU) {
+      blog(LOG_WARNING,
+           "GPU inference failed with provider '%s': %s. Falling back to CPU.",
+           tf->useGPU.c_str(), e.what());
+      if (!tryCreateCpuFallbackSession(tf)) {
+        return false;
+      }
+      // New session has new buffers; reload inputs and retry once.
+      tf->model->getNetworkInputSize(tf->inputDims, inputWidth, inputHeight);
+      tf->model->loadInputToTensor(preprocessedImage, inputWidth, inputHeight,
+                                   tf->inputTensorValues);
+      try {
+        tf->model->runNetworkInference(tf->session, tf->inputNames, tf->outputNames,
+                                       tf->inputTensor, tf->outputTensor);
+      } catch (const Ort::Exception &retryEx) {
+        blog(LOG_ERROR, "CPU fallback inference also failed: %s", retryEx.what());
+        return false;
+      }
+    } else {
+      blog(LOG_ERROR, "ONNXRuntime Exception: %s", e.what());
+      return false;
+    }
+#else
+    blog(LOG_ERROR, "ONNXRuntime Exception: %s", e.what());
+    return false;
+#endif
+  }
 
   // Get output
   // Map network output to cv::Mat

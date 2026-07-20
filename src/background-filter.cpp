@@ -321,6 +321,11 @@ void filter_video_tick(void *data, float seconds)
       // Process the image to find the mask.
       processImageForBackground(tf, imageBGRA, backgroundMask);
 
+      // Inference can fail (or fall back without producing a frame); keep last mask.
+      if (backgroundMask.empty()) {
+        return;
+      }
+
       // Contour processing
       // Only applicable if we are thresholding (and get a binary image)
       if (tf->enableThreshold) {
@@ -368,8 +373,8 @@ void filter_video_tick(void *data, float seconds)
       backgroundMask.copyTo(tf->backgroundMask);
     }
   } catch (const Ort::Exception &e) {
+    // Primary GPU→CPU fallback lives in runFilterModelInference; this is a last resort.
     blog(LOG_ERROR, "ONNXRuntime Exception: %s", e.what());
-    // TODO: Fall back to CPU if it makes sense
   } catch (const std::exception &e) {
     blog(LOG_ERROR, "%s", e.what());
   }

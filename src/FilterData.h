@@ -29,7 +29,10 @@ struct filter_data : public ORTModelData {
   std::mutex inputBGRALock;
   std::mutex outputLock;
 
+  // Owned path used for session (re)creation. modelFilepath points into this storage.
+  std::string modelFilepathStorage;
 #if _WIN32
+  std::wstring modelFilepathWStorage;
   const wchar_t *modelFilepath = nullptr;
 #else
   const char *modelFilepath = nullptr;
