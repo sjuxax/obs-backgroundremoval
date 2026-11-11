@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -63,14 +64,32 @@ void setupLinuxAmdCaches()
       bfree(miopenPathRaw);
     }
 
+    // MIGraphX can return a transposed view (e.g. NHWC strides on an NCHW-shaped
+    // tensor) as a program output. ORT treats outputs as packed, so the values
+    // land in the wrong positions (PPHumanSeg comes back scrambled).
+    // standardize_outputs makes MIGraphX copy such outputs to a standard layout.
+    // MIGraphX reads this once per process, so it must be set before any compile.
+    const char *gpuOptions = std::getenv("MIGRAPHX_GPU_OPTIONS");
+    if (gpuOptions == nullptr) {
+      setenv("MIGRAPHX_GPU_OPTIONS", "{standardize_outputs:true}", 0);
+    } else if (std::string(gpuOptions).find("standardize_outputs") == std::string::npos) {
+      blog(LOG_WARNING,
+           "MIGRAPHX_GPU_OPTIONS is set without standardize_outputs; models with "
+           "transposed outputs (e.g. PPHumanSeg) may produce wrong masks on MIGraphX");
+    }
+
     if (migraphxPathRaw != nullptr) {
       const std::filesystem::path migraphxPath(migraphxPathRaw);
+      // The EP's MXR cache key covers neither MIGraphX backend options nor the
+      // real MIGraphX version, so MXRs compiled elsewhere (or without
+      // standardize_outputs) would be loaded as-is. Keep a private cache.
+      const std::filesystem::path modelCachePath = migraphxPath / "standardized-outputs";
       std::error_code ec;
-      std::filesystem::create_directories(migraphxPath, ec);
-      // Env vars used by older ORT builds; newer builds also take model cache via
-      // provider options where available.
+      // The EP aborts the session if the cache directory doesn't exist.
+      std::filesystem::create_directories(modelCachePath, ec);
       setLinuxEnvironmentPathIfUnset("ORT_MIGRAPHX_CACHE_PATH", migraphxPath);
-      setLinuxEnvironmentPathIfUnset("ORT_MIGRAPHX_MODEL_CACHE_PATH", migraphxPath);
+      setenv("ORT_MIGRAPHX_MODEL_CACHE_PATH", modelCachePath.lexically_normal().c_str(), 1);
+      blog(LOG_INFO, "MIGraphX compiled-model cache: %s", modelCachePath.c_str());
       bfree(migraphxPathRaw);
     }
   });
