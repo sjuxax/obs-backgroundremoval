@@ -95,6 +95,23 @@ void setupLinuxAmdCaches()
   });
 }
 
+// Some bundled models hit MIGraphX limitations that an equivalent rewrite
+// avoids (see scripts/migraphx_model_variants.py). Prefer
+// models/migraphx/<file> when it exists.
+std::string resolveMIGraphXModelFile(const std::string &modelSelection)
+{
+  const std::filesystem::path selection(modelSelection);
+  const std::string variant =
+    (selection.parent_path() / "migraphx" / selection.filename()).generic_string();
+  char *variantPath = obs_module_file(variant.c_str());
+  if (variantPath == nullptr) {
+    return modelSelection;
+  }
+  bfree(variantPath);
+  blog(LOG_INFO, "Using MIGraphX model variant %s", variant.c_str());
+  return variant;
+}
+
 Ort::Env &getSharedOrtEnv()
 {
   static Ort::Env env = []() {
@@ -327,10 +344,18 @@ void createOrtSession(filter_data *tf)
     return;
   }
 
-  char *modelFilepath_rawPtr = obs_module_file(tf->modelSelection.c_str());
+  std::string modelFile = tf->modelSelection;
+#if defined(__linux__)
+  tf->useGPU = normalizeGpuProviderSelection(tf->useGPU);
+  if (tf->useGPU == USEGPU_MIGRAPHX) {
+    modelFile = resolveMIGraphXModelFile(modelFile);
+  }
+#endif
+
+  char *modelFilepath_rawPtr = obs_module_file(modelFile.c_str());
 
   if (modelFilepath_rawPtr == nullptr) {
-    blog(LOG_ERROR, "Unable to get model filename %s from plugin.", tf->modelSelection.c_str());
+    blog(LOG_ERROR, "Unable to get model filename %s from plugin.", modelFile.c_str());
     return;
   }
 
@@ -346,7 +371,6 @@ void createOrtSession(filter_data *tf)
 
   try {
 #if defined(__linux__)
-    tf->useGPU = normalizeGpuProviderSelection(tf->useGPU);
     Ort::SessionOptions sessionOptions;
     configureSessionOptions(tf, sessionOptions);
     resetOrtSessionState(tf);
